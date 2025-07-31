@@ -1,0 +1,33 @@
+[package]
+name = "dashdotcache"
+version = "0.1.0"
+edition = "2024"
+authors = ["Dashiell Vallance <dash@dashdot.me>"]
+
+[dependencies]
+tokio = { version = "1.47", features = ["full"] }
+
+dashmap = { version = "6.1.0", features = ["raw-api"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+redis-protocol = "6.0.0"
+tracing = "0.1.41"
+thiserror = "2.0.12"
+rand = "0.9.2"
+
+[dev-dependencies]
+criterion = "0.7"
+
+[lib]
+name = "dashdotcache"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dashdotcacheserver"
+path = "src/main.rs"
+
+[[bench]]
+name = "cache_benchmarks"
+harness = false
