@@ -2,14 +2,14 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::cache_errors::CacheError;
 
-/// Configuration for the cache
 #[derive(Debug, Clone)]
 pub struct Config {
     pub max_memory: Option<usize>,
@@ -29,7 +29,6 @@ impl Default for Config {
     }
 }
 
-/// All possible value types that can be stored in the cache
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Value {
     String(String),
@@ -75,22 +74,23 @@ impl Value {
             Value::Float(_) => std::mem::size_of::<f64>(),
             Value::Bytes(b) => b.capacity(),
             Value::Hash(h) => {
-                // Start with the base size of the HashMap itself
                 let mut size = std::mem::size_of_val(h);
-                // Add the capacity of all keys and the usage of all values
-                size += h.iter().map(|(k, v)| k.capacity() + v.memory_usage()).sum::<usize>();
+                size += h
+                    .iter()
+                    .map(|(k, v)| k.capacity() + v.memory_usage())
+                    .sum::<usize>();
                 size
-            },
+            }
             Value::List(l) => {
                 let mut size = std::mem::size_of_val(l);
                 size += l.iter().map(|v| v.memory_usage()).sum::<usize>();
                 size
-            },
+            }
             Value::Set(s) => {
                 let mut size = std::mem::size_of_val(s);
                 size += s.iter().map(|v| v.capacity()).sum::<usize>();
                 size
-            },
+            }
         }
     }
 
@@ -107,7 +107,6 @@ impl Value {
     }
 }
 
-/// TTL information
 #[derive(Debug, Clone)]
 pub struct Ttl {
     pub expires_at: Instant,
@@ -152,7 +151,6 @@ impl Ttl {
     }
 }
 
-/// Cache Data Entry
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub value: Value,
@@ -209,11 +207,11 @@ impl Entry {
 
         if let Some(parent_key) = &self.parent {
             match cache.get(parent_key) {
-                Some(parent_entry) => parent_entry.is_valid(cache), // <-- Recursion
-                None => false, // Parent doesn't exist = this entry is invalid
+                Some(parent_entry) => parent_entry.is_valid(cache),
+                None => false,
             }
         } else {
-            true // No parent dependency = valid
+            true
         }
     }
 
@@ -226,17 +224,11 @@ impl Entry {
     }
 
     pub fn memory_usage(&self) -> usize {
-        // 1. Get the stack size of the entire Entry struct.
-        // This automatically includes all fixed-size fields and the size of the `Option` wrappers.
         let mut size = std::mem::size_of_val(self);
 
-        // 2. Add the heap-allocated size of the value itself.
         size += self.value.memory_usage();
 
-        // 3. Add the heap-allocated size of the parent string, if it exists.
         if let Some(parent) = &self.parent {
-            // `size_of_val` already accounted for the `String` struct itself (pointer, len, capacity).
-            // We only need to add the size of the characters on the heap.
             size += parent.capacity();
         }
 
@@ -254,18 +246,43 @@ pub struct Stats {
     pub memory_usage: AtomicUsize,
 }
 
+impl Stats {
+    /// Prints all metrics in prometheus format
+    pub fn render(&self) -> String {
+        let mut s = String::with_capacity(256);
+
+        macro_rules! write_metric {
+            ($buffer:expr, $name:expr, $help:expr, $type:expr, $value:expr) => {
+                writeln!($buffer, "# HELP {} {}", $name, $help).unwrap();
+                writeln!($buffer, "# TYPE {} {}", $name, $type).unwrap();
+                writeln!($buffer, "{} {}", $name, $value).unwrap();
+            };
+        }
+
+        write_metric!(&mut s, "cache_hits_total", "Total number of cache hits", "counter", self.hits.load(Ordering::Relaxed));
+        write_metric!(&mut s, "cache_misses_total", "Total number of cache misses", "counter", self.misses.load(Ordering::Relaxed));
+        write_metric!(&mut s, "cache_sets_total", "Total number of SET operations", "counter", self.sets.load(Ordering::Relaxed));
+        write_metric!(&mut s, "cache_deletes_total", "Total number of DELETE operations", "counter", self.deletes.load(Ordering::Relaxed));
+        write_metric!(&mut s, "cache_memory_usage_bytes", "Current estimated memory usage in bytes", "gauge", self.memory_usage.load(Ordering::Relaxed));
+
+        s
+    }
+}
+
 pub struct Cache {
     data: DashMap<String, Entry>,
     config: Config,
     stats: Arc<Stats>,
     cleanup_shard_index: AtomicUsize,
-    dependency_lock: RwLock<()>
+    dependency_lock: RwLock<()>,
 }
 
-#[derive(Default)]
-pub struct SetOptionals {
+#[derive(Clone, Debug, Default)]
+pub struct SetOptions {
     pub ttl: Option<Duration>,
     pub parent: Option<String>,
+    pub nx: bool, // not exists: flag for 'set', to set only if key is new
+    pub xx: bool, // exists: flag for 'set', to update only if key pre-exists
 }
 
 impl Cache {
@@ -275,7 +292,7 @@ impl Cache {
             config,
             stats: Arc::new(Stats::default()),
             cleanup_shard_index: AtomicUsize::new(0),
-            dependency_lock: RwLock::new(())
+            dependency_lock: RwLock::new(()),
         }
     }
 
@@ -301,11 +318,36 @@ impl Cache {
         }
     }
 
-    pub fn set(&self, key: String, value: Value, optionals: SetOptionals) -> Result<(), CacheError> {
-        if let Some(ref parent_key) = optionals.parent {
-            // stop race conditions from creating dependency cycles
-            let _lock = self.dependency_lock.write().unwrap();
+    pub fn ttl(&self, key: &str) -> i64 {
+        let Some(entry) = self.data.get(key) else {
+            return -2;
+        };
 
+        let Some(ttl) = &entry.ttl else {
+            return -1;
+        };
+
+        ttl.remaining().map(|r| r.as_secs() as i64).unwrap_or(-2)
+    }
+
+    /// Sets an entry, with synchronous writes for parent refs to avoid cycles
+    pub fn set(&self, key: String, value: Value, options: SetOptions) -> Result<bool, CacheError> {
+        // Branch: parent refs require validation under a dependency_lock to avoid inserting cycles
+        let _dependency_guard = if options.parent.is_some() || options.nx || options.xx {
+            Some(self.dependency_lock.write().unwrap())
+        } else {
+            None
+        };
+
+        let exists = self.data.contains_key(&key);
+        if options.nx && exists {
+            return Ok(false);
+        }
+        if options.xx && !exists {
+            return Ok(false);
+        }
+
+        if let Some(ref parent_key) = options.parent {
             if !self.config.enable_dependencies {
                 return Err(CacheError::DependenciesDisabled);
             }
@@ -321,30 +363,66 @@ impl Cache {
 
         let entry = Entry {
             value,
-            ttl: optionals.ttl.map(Ttl::new),
-            parent: optionals.parent,
+            ttl: options.ttl.map(Ttl::new),
+            parent: options.parent,
             access_count: 0,
             last_accessed: Instant::now(),
             created_at: Instant::now(),
         };
 
-        self.insert_entry(key, entry)
+        debug!("Inserted key {}", key);
+        self.insert_entry(key, entry)?;
+        Ok(true)
+    }
+
+    pub fn expire(&self, key: &str, seconds: u64) -> bool {
+        let _guard = self.dependency_lock.write().unwrap();
+
+        self.data
+            .get_mut(key)
+            .map(|mut entry| {
+                entry.ttl = Some(Ttl::new(Duration::from_secs(seconds)));
+            })
+            .is_some()
+    }
+
+    pub fn persist(&self, key: &str) -> bool {
+        let _guard = self.dependency_lock.write().unwrap();
+
+        self.data
+            .get_mut(key)
+            .map(|mut entry| {
+                entry.ttl = None;
+            })
+            .is_some()
+    }
+
+    pub fn del(&self, keys: &[&str]) -> usize {
+        let mut deleted_count: usize = 0;
+        let mut total_memory_freed = 0;
+
+        {
+            let _guard = self.dependency_lock.write().unwrap();
+
+            for &key in keys {
+                if let Some((removed_key, entry)) = self.data.remove(key) {
+                    deleted_count += 1;
+                    total_memory_freed += removed_key.capacity() + entry.memory_usage();
+                }
+            }
+        }
+
+        self.stats
+            .deletes
+            .fetch_add(deleted_count as u64, Ordering::Relaxed);
+        self.stats
+            .memory_usage
+            .fetch_sub(total_memory_freed, Ordering::Relaxed);
+        deleted_count
     }
 
     pub fn delete(&self, key: &str) -> bool {
-        match self.data.remove(key) {
-            Some((removed_key, entry)) => {
-                let memory_delta = removed_key.capacity() + entry.memory_usage();
-
-                self.stats.deletes.fetch_add(1, Ordering::Relaxed);
-                self.stats
-                    .memory_usage
-                    .fetch_sub(memory_delta, Ordering::Relaxed);
-                debug!("Deleted key: {}", key);
-                true
-            }
-            None => false,
-        }
+        self.del(&[key]) == 1
     }
 
     pub fn exists(&self, key: &str) -> bool {
@@ -354,19 +432,70 @@ impl Cache {
         }
     }
 
-    /// Get all keys (expensive - use sparingly)
+    pub fn exists_multi(&self, keys: &[&str]) -> usize {
+        keys.iter()
+            .map(|key| if self.exists(key) { 1 } else { 0 })
+            .sum()
+    }
+
+    // Slow, avoid
     pub fn keys(&self, pattern: &str) -> Vec<String> {
         self.data
             .iter()
             .filter_map(|item| {
                 let key = item.key();
-                if item.value().is_valid(&self.data) && matches_pattern(key, pattern) {
+                if matches_pattern(key, pattern) {
                     Some(key.clone())
                 } else {
                     None
                 }
             })
             .collect()
+    }
+
+    pub fn parent(&self, key: &str) -> Option<String> {
+        self.data.get(key).and_then(|entry| entry.parent.clone())
+    }
+
+    // Slow
+    pub fn children(&self, parent_key: &str) -> Vec<String> {
+        self.data
+            .iter()
+            .filter_map(|entry| {
+                if entry.parent == Some(parent_key.to_string()) {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+        .collect()
+    }
+
+    // Slow, avoid
+    pub fn children_recursive(&self, parent_key: &str, max_depth: usize) -> Vec<(String, usize)> {
+        let mut result = Vec::new();
+        let mut current_parents: HashSet<String> = [parent_key.to_string()].into();
+
+        for depth in 1..=max_depth {
+            if current_parents.is_empty() {
+                break;
+            }
+
+            let mut next_parents = HashSet::new();
+
+            for entry in self.data.iter() {
+                if let Some(parent) = &entry.parent {
+                    if current_parents.contains(parent) {  // O(1) lookup
+                        let child = entry.key().clone();
+                        result.push((child.clone(), depth));
+                        next_parents.insert(child);
+                    }
+                }
+            }
+
+            current_parents = next_parents;
+        }
+        result
     }
 
     pub fn flush_all(&self) {
@@ -382,11 +511,9 @@ impl Cache {
         self.data.len()
     }
 
-    /// Note: estimated for now
     pub fn memory_usage(&self) -> usize {
         self.stats.memory_usage.load(Ordering::Relaxed)
     }
-
 
     /// Probabilistic cleanup: iterates over underlying shards in the DashMap,
     /// taking random samples in a round robin.
@@ -395,7 +522,7 @@ impl Cache {
 
         let shards = self.data.shards();
         if shards.is_empty() {
-            return 0
+            return 0;
         }
 
         let shard_counter = self.cleanup_shard_index.fetch_add(1, Ordering::Relaxed);
@@ -406,7 +533,9 @@ impl Cache {
             let shard_guard = shard.read();
             let shard_size = shard_guard.len();
 
-            if shard_size == 0  { return 0; }
+            if shard_size == 0 {
+                return 0;
+            }
 
             let (skip, take) = if shard_size < NUM_SAMPLES {
                 (0, shard_size)
@@ -430,14 +559,16 @@ impl Cache {
                 .collect()
         }; // lock released
 
-        keys_to_delete
-            .iter()
-            .filter(|key| self.delete(key))
-            .count()
-   }
+        self.del(
+            &keys_to_delete
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        )
+    }
 
-    /// Used to check for cycles before adding a parent dependency.
-    /// Note: race condition here - must be accessed and updated atomically
+    /// Used to check for cycles before adding a parent dependency
+    /// Access under the dependency_lock, or you might allow cycles
     fn would_create_cycle(&self, key: &str, parent: &str) -> bool {
         if key == parent {
             return true;
@@ -447,28 +578,23 @@ impl Cache {
         let mut current_option = Some(parent.to_string());
 
         while let Some(current_key) = current_option {
-            // expected case, trying to add a cycle - disallow this action
             if current_key == key {
                 return true;
             }
 
-            // worst case: pre-existing cycle in graph
             if !visited.insert(current_key.clone()) {
                 return true;
             }
 
-            // traverse up
             current_option = self.data.get(&current_key).and_then(|e| e.parent.clone());
         }
 
         false
     }
 
-    /// Internal: Insert entry with validation
     fn insert_entry(&self, key: String, entry: Entry) -> Result<(), CacheError> {
         let memory_delta = key.capacity() + entry.memory_usage();
 
-        // Check memory limit
         if let Some(max_memory) = self.config.max_memory {
             let current_memory = self.memory_usage();
             if current_memory + memory_delta > max_memory {
@@ -476,14 +602,12 @@ impl Cache {
             }
         }
 
-        // Check key count limit
         if let Some(max_keys) = self.config.max_keys {
             if self.data.len() >= max_keys && !self.data.contains_key(&key) {
                 return Err(CacheError::KeyLimitExceeded);
             }
         }
 
-        // Insert the entry
         self.data.insert(key, entry);
         self.stats.sets.fetch_add(1, Ordering::Relaxed);
         self.stats
@@ -494,13 +618,11 @@ impl Cache {
     }
 }
 
-/// Simple glob pattern matching
 fn matches_pattern(key: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
 
-    // Simple implementation - just handle * at the end
     if pattern.ends_with('*') {
         let prefix = &pattern[..pattern.len() - 1];
         key.starts_with(prefix)
@@ -525,13 +647,10 @@ mod tests {
             .set(
                 "key1".to_string(),
                 Value::String("value1".to_string()),
-                SetOptionals::default(),
+                SetOptions::default(),
             )
             .unwrap();
-        assert_eq!(
-            cache.get("key1"),
-            Some(Value::String("value1".to_string()))
-        );
+        assert_eq!(cache.get("key1"), Some(Value::String("value1".to_string())));
 
         // Test get().is_some() for existence
         assert!(cache.get("key1").is_some());
@@ -551,7 +670,7 @@ mod tests {
             .set(
                 "temp".to_string(),
                 Value::String("temp_value".to_string()),
-                SetOptionals {
+                SetOptions {
                     ttl: Some(Duration::from_millis(1)),
                     ..Default::default()
                 },
@@ -582,7 +701,7 @@ mod tests {
             .set(
                 "parent".to_string(),
                 Value::String("parent_value".to_string()),
-                SetOptionals::default(),
+                SetOptions::default(),
             )
             .unwrap();
 
@@ -591,7 +710,7 @@ mod tests {
             .set(
                 "child".to_string(),
                 Value::String("child_value".to_string()),
-                SetOptionals {
+                SetOptions {
                     parent: Some("parent".to_string()),
                     ..Default::default()
                 },
@@ -621,14 +740,14 @@ mod tests {
             .set(
                 "a".to_string(),
                 Value::String("a".to_string()),
-                SetOptionals::default(),
+                SetOptions::default(),
             )
             .unwrap();
         cache
             .set(
                 "b".to_string(),
                 Value::String("b".to_string()),
-                SetOptionals::default(),
+                SetOptions::default(),
             )
             .unwrap();
 
@@ -637,7 +756,7 @@ mod tests {
             .set(
                 "a".to_string(),
                 Value::String("a2".to_string()),
-                SetOptionals {
+                SetOptions {
                     parent: Some("b".to_string()),
                     ..Default::default()
                 },
@@ -648,7 +767,7 @@ mod tests {
         let result = cache.set(
             "b".to_string(),
             Value::String("b2".to_string()),
-            SetOptionals {
+            SetOptions {
                 parent: Some("a".to_string()),
                 ..Default::default()
             },
@@ -672,7 +791,7 @@ mod tests {
         let entry = Entry::new(value.clone());
         let expected_size = key.len() + entry.memory_usage();
 
-        let result = cache.set(key, value, SetOptionals::default());
+        let result = cache.set(key, value, SetOptions::default());
 
         if let Err(e) = result {
             panic!(
@@ -684,7 +803,7 @@ mod tests {
         }
 
         let large_value = Value::String("x".repeat(200));
-        let result = cache.set("large".to_string(), large_value, SetOptionals::default());
+        let result = cache.set("large".to_string(), large_value, SetOptions::default());
 
         assert!(matches!(result, Err(CacheError::MemoryLimitExceeded)));
     }
@@ -698,7 +817,7 @@ mod tests {
             .set(
                 "exp1".to_string(),
                 Value::String("1".to_string()),
-                SetOptionals {
+                SetOptions {
                     ttl: Some(Duration::from_millis(1)),
                     ..Default::default()
                 },
@@ -708,7 +827,7 @@ mod tests {
             .set(
                 "exp2".to_string(),
                 Value::String("2".to_string()),
-                SetOptionals {
+                SetOptions {
                     ttl: Some(Duration::from_millis(1)),
                     ..Default::default()
                 },
@@ -718,7 +837,7 @@ mod tests {
             .set(
                 "keep".to_string(),
                 Value::String("keep".to_string()),
-                SetOptionals::default(),
+                SetOptions::default(),
             )
             .unwrap();
 
@@ -749,14 +868,14 @@ mod tests {
             .set(
                 "d".to_string(),
                 Value::String("d".to_string()),
-                SetOptionals::default(),
+                SetOptions::default(),
             )
             .unwrap();
         cache
             .set(
                 "c".to_string(),
                 Value::String("c".to_string()),
-                SetOptionals {
+                SetOptions {
                     parent: Some("d".to_string()),
                     ..Default::default()
                 },
@@ -766,7 +885,7 @@ mod tests {
             .set(
                 "b".to_string(),
                 Value::String("b".to_string()),
-                SetOptionals {
+                SetOptions {
                     parent: Some("c".to_string()),
                     ..Default::default()
                 },
@@ -776,7 +895,7 @@ mod tests {
             .set(
                 "a".to_string(),
                 Value::String("a".to_string()),
-                SetOptionals {
+                SetOptions {
                     parent: Some("b".to_string()),
                     ..Default::default()
                 },
@@ -787,7 +906,7 @@ mod tests {
         let result = cache.set(
             "d".to_string(),
             Value::String("d2".to_string()),
-            SetOptionals {
+            SetOptions {
                 parent: Some("a".to_string()),
                 ..Default::default()
             },
@@ -798,7 +917,7 @@ mod tests {
         let result = cache.set(
             "c".to_string(),
             Value::String("c2".to_string()),
-            SetOptionals {
+            SetOptions {
                 parent: Some("a".to_string()),
                 ..Default::default()
             },

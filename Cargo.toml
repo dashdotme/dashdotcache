@@ -5,6 +5,7 @@ edition = "2024"
 authors = ["Dashiell Vallance <dash@dashdot.me>"]
 
 [dependencies]
+axum = "0.8"
 tokio = { version = "1.47", features = ["full"] }
 
 dashmap = { version = "6.1.0", features = ["raw-api"] }
