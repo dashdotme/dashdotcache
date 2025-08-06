@@ -1,79 +1,133 @@
 #!/usr/bin/env -S nix shell nixpkgs#curl nixpkgs#jq --command bash
 
+# Helper function to handle responses that may or may not be JSON
+handle_response() {
+    local response="$1"
+    # Try to parse as JSON, if it fails, just echo the response
+    if echo "$response" | jq . >/dev/null 2>&1; then
+        echo "$response" | jq .
+    else
+        echo "$response"
+    fi
+}
+
+# The base URL of the running server
 BASE_URL="http://127.0.0.1:8080"
 
-echo "🚀 Testing Dashdotcache REST API"
-echo "================================="
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-echo "1. Testing PING..."
-curl -s -X POST "$BASE_URL/ping" \
+echo -e "${BLUE}🚀 Testing Dashdotcache REST API at $BASE_URL${NC}"
+echo "=============================================="
+
+# ==============================================================================
+# Setup
+# ==============================================================================
+echo -e "\n${GREEN}0. Flushing database for a clean slate...${NC}"
+response=$(curl -s -X POST "$BASE_URL/flush")
+handle_response "$response"
+
+# ==============================================================================
+# Core Commands
+# ==============================================================================
+echo -e "\n${GREEN}1. Testing PING...${NC}"
+response=$(curl -s -X POST "$BASE_URL/ping" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Hello Server"}')
+handle_response "$response"
+
+echo -e "\n${GREEN}2. Setting key 'hello' = 'world'...${NC}"
+response=$(curl -s -X POST "$BASE_URL/keys/hello" \
+  -H "Content-Type: application/json" \
+  -d '{"value": "world"}')
+handle_response "$response"
+
+echo -e "\n${GREEN}3. Getting key 'hello'...${NC}"
+curl -s -X GET "$BASE_URL/keys/hello" | jq '.'
+
+echo -e "\n${GREEN}4. Setting key 'temp' with 60s TTL...${NC}"
+response=$(curl -s -X POST "$BASE_URL/keys/temp" \
+  -H "Content-Type: application/json" \
+  -d '{"value": "temporary", "ttl": 60}')
+handle_response "$response"
+
+echo -e "\n${GREEN}5. Getting TTL for 'temp'...${NC}"
+curl -s -X GET "$BASE_URL/keys/temp/ttl" | jq '.'
+
+echo -e "\n${GREEN}6. Getting full info for 'hello'...${NC}"
+curl -s -X GET "$BASE_URL/keys/hello/info" | jq '.'
+
+# ==============================================================================
+# Relationship Commands (NEW)
+# ==============================================================================
+echo -e "\n${GREEN}7. Setting up parent/child relationships...${NC}"
+echo "  - Creating keys: p1, c1, gc1"
+curl -s -X POST "$BASE_URL/keys/p1" -H "Content-Type: application/json" -d '{"value": "parent"}' > /dev/null
+curl -s -X POST "$BASE_URL/keys/c1" -H "Content-Type: application/json" -d '{"value": "child"}' > /dev/null
+curl -s -X POST "$BASE_URL/keys/gc1" -H "Content-Type: application/json" -d '{"value": "grandchild"}' > /dev/null
+
+echo "  - Setting c1's parent to p1..."
+response=$(curl -s -X POST "$BASE_URL/keys/c1/parent" \
+  -H "Content-Type: application/json" \
+  -d '{"parent": "p1"}')
+handle_response "$response"
+
+echo "  - Setting gc1's parent to c1..."
+response=$(curl -s -X POST "$BASE_URL/keys/gc1/parent" \
+  -H "Content-Type: application/json" \
+  -d '{"parent": "c1"}')
+handle_response "$response"
+
+echo -e "\n${GREEN}8. Getting immediate children of 'p1' (default depth)...${NC}"
+curl -s -X GET "$BASE_URL/keys/p1/children" \
   -H "Content-Type: application/json" \
   -d '{}' | jq '.'
 
-echo -e "\n2. Setting key 'hello' = 'world'..."
-curl -s -X POST "$BASE_URL/keys/hello" \
+echo -e "\n${GREEN}9. Getting recursive children of 'p1' (depth=2)...${NC}"
+curl -s -X GET "$BASE_URL/keys/p1/children" \
   -H "Content-Type: application/json" \
-  -d '{"value": "world"}' | jq '.'
+  -d '{"depth": 2}' | jq '.'
 
-echo -e "\n3. Getting key 'hello'..."
-curl -s -X GET "$BASE_URL/keys/hello" | jq '.'
+# ==============================================================================
+# Listing and Bulk Commands
+# ==============================================================================
+echo -e "\n${GREEN}10. Setting up keys for listing (list:1, list:2)...${NC}"
+curl -s -X POST "$BASE_URL/keys/list:1" -H "Content-Type: application/json" -d '{"value": "one"}' > /dev/null
+curl -s -X POST "$BASE_URL/keys/list:2" -H "Content-Type: application/json" -d '{"value": "two"}' > /dev/null
 
-echo -e "\n4. Setting key 'temp' with 60s TTL..."
-curl -s -X POST "$BASE_URL/keys/temp" \
-  -H "Content-Type: application/json" \
-  -d '{"value": "temporary", "ttl": 60}' | jq '.'
+echo -e "\n${GREEN}11. Listing keys with pattern 'list:*' (as query string)...${NC}"
+curl -s -G "$BASE_URL/keys" \
+  --data-urlencode "pattern=list:*" | jq '.'
 
-echo -e "\n5. Getting TTL for 'temp'..."
-curl -s -X GET "$BASE_URL/keys/temp/ttl" | jq '.'
+echo -e "\n${GREEN}12. Listing keys with pattern 'list:*' and limit 1...${NC}"
+curl -s -G "$BASE_URL/keys" \
+  --data-urlencode "pattern=list:*" \
+  --data-urlencode "limit=1" | jq '.'
 
-echo -e "\n6. Setting expiration on 'hello' (30 seconds)..."
-curl -s -X POST "$BASE_URL/keys/hello/expire" \
-  -H "Content-Type: application/json" \
-  -d '{"seconds": 30}' | jq '.'
-
-echo -e "\n7. Getting full info for 'hello'..."
-curl -s -X GET "$BASE_URL/keys/hello/info" | jq '.'
-
-echo -e "\n8. Checking if keys exist..."
+echo -e "\n${GREEN}13. Checking if keys exist...${NC}"
 curl -s -X POST "$BASE_URL/keys/exists" \
   -H "Content-Type: application/json" \
-  -d '{"keys": ["hello", "temp", "nonexistent"]}' | jq '.'
+  -d '{"keys": ["hello", "temp", "p1", "nonexistent"]}' | jq '.'
 
-echo -e "\n9. Deleting key 'temp'..."
-curl -s -X DELETE "$BASE_URL/keys/temp" | jq '.'
-
-echo -e "\n10. Trying to get deleted key 'temp'..."
-curl -s -X GET "$BASE_URL/keys/temp" | jq '.'
-
-echo -e "\n11. Setting multiple keys for bulk delete test..."
-curl -s -X POST "$BASE_URL/keys/test1" \
+echo -e "\n${GREEN}14. Deleting multiple keys...${NC}"
+response=$(curl -s -X DELETE "$BASE_URL/keys" \
   -H "Content-Type: application/json" \
-  -d '{"value": "value1"}' > /dev/null
+  -d '{"keys": ["list:1", "list:2", "temp"]}')
+handle_response "$response"
 
-curl -s -X POST "$BASE_URL/keys/test2" \
-  -H "Content-Type: application/json" \
-  -d '{"value": "value2"}' > /dev/null
+# ==============================================================================
+# Admin and Meta Commands
+# ==============================================================================
+echo -e "\n${GREEN}15. Getting cache stats...${NC}"
+curl -s -X GET "$BASE_URL/stats"
+echo ""
 
-curl -s -X POST "$BASE_URL/keys/test3" \
-  -H "Content-Type: application/json" \
-  -d '{"value": "value3"}' > /dev/null
-
-echo "Bulk deleting test1, test2, test3..."
-curl -s -X DELETE "$BASE_URL/keys" \
-  -H "Content-Type: application/json" \
-  -d '{"keys": ["test1", "test2", "test3"]}' | jq '.'
-
-echo -e "\n12. Getting cache stats..."
-curl -s -X GET "$BASE_URL/stats" | jq '.'
-
-echo -e "\n13. Getting metrics..."
+echo -e "\n${GREEN}16. Getting metrics...${NC}"
 curl -s -X GET "$BASE_URL/metrics"
+echo ""
 
-echo -e "\n14. Getting dashboard..."
-curl -s -X GET "$BASE_URL/dash" | jq '.'
-
-echo -e "\n15. Persisting key 'hello' (removing TTL)..."
-curl -s -X POST "$BASE_URL/keys/hello/persist" | jq '.'
-
-echo -e "\n✅ Tests completed!"
-echo "Note: Some placeholder endpoints will return 'not implemented' errors - this is expected."
+echo -e "\n${RED}==============================================${NC}"
+echo -e "${RED}✅ All tests completed!${NC}"

@@ -402,26 +402,28 @@ impl Cache {
         Ok(true)
     }
 
-    pub fn expire(&self, key: &str, seconds: u64) -> bool {
+    pub fn expire(&self, key: &str, seconds: u64) -> i64 {
         let _guard = self.dependency_lock.write().unwrap();
 
-        self.data
-            .get_mut(key)
-            .map(|mut entry| {
+        match self.data.get_mut(key) {
+            Some(mut entry) => {
                 entry.ttl = Some(Ttl::new(Duration::from_secs(seconds)));
-            })
-            .is_some()
+                1
+            }
+            None => 0,
+        }
     }
 
-    pub fn persist(&self, key: &str) -> bool {
+    pub fn persist(&self, key: &str) -> i64 {
         let _guard = self.dependency_lock.write().unwrap();
 
-        self.data
-            .get_mut(key)
-            .map(|mut entry| {
+        match self.data.get_mut(key) {
+            Some(mut entry) => {
                 entry.ttl = None;
-            })
-            .is_some()
+                1
+            }
+            None => 0,
+        }
     }
 
     pub fn del(&self, keys: &[&str]) -> usize {
@@ -466,17 +468,12 @@ impl Cache {
     }
 
     // Slow, avoid
-    pub fn keys(&self, pattern: &str) -> Vec<String> {
+    pub fn keys(&self, pattern: &str, limit: usize) -> Vec<String> {
         self.data
             .iter()
-            .filter_map(|item| {
-                let key = item.key();
-                if matches_pattern(key, pattern) {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            })
+            .filter(|item| matches_pattern(item.key(), pattern))
+            .take(limit)
+            .map(|item| item.key().clone())
             .collect()
     }
 
@@ -484,22 +481,27 @@ impl Cache {
         self.data.get(key).and_then(|entry| entry.parent.clone())
     }
 
-    // Slow
-    pub fn children(&self, parent_key: &str) -> Vec<String> {
-        self.data
-            .iter()
-            .filter_map(|entry| {
-                if entry.parent == Some(parent_key.to_string()) {
-                    Some(entry.key().clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
+    pub fn set_parent(&self, key: &str, parent: String) -> Result<i64, CacheError> {
+        let _guard = self.dependency_lock.write().unwrap();
+
+        if !self.data.contains_key(&parent) {
+            return Err(CacheError::ParentNotFound(parent.clone()));
+        }
+
+        if self.would_create_cycle(key, &parent) {
+            return Err(CacheError::DependencyCycle(key.to_string(), parent.clone()));
+        }
+
+        match self.data.get_mut(key) {
+            Some(mut entry) => {
+                entry.parent = Some(parent);
+                Ok(1)
+            }
+            None => Ok(0),
+        }
     }
 
-    // Slow, avoid
-    pub fn children_recursive(&self, parent_key: &str, max_depth: usize) -> Vec<(String, usize)> {
+    pub fn children_recursive(&self, parent_key: &str, max_depth: usize) -> Vec<(String, u64)> {
         let mut result = Vec::new();
         let mut current_parents: HashSet<String> = [parent_key.to_string()].into();
 
@@ -513,9 +515,8 @@ impl Cache {
             for entry in self.data.iter() {
                 if let Some(parent) = &entry.parent {
                     if current_parents.contains(parent) {
-                        // O(1) lookup
                         let child = entry.key().clone();
-                        result.push((child.clone(), depth));
+                        result.push((child.clone(), depth as u64));
                         next_parents.insert(child);
                     }
                 }

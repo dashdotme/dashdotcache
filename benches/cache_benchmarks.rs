@@ -68,7 +68,7 @@ fn cache_performance(c: &mut Criterion) {
                 .unwrap();
         }
 
-        b.iter(|| black_box(cache.children("parent").len()));
+        b.iter(|| black_box(cache.children_recursive("parent", 5).len()));
     });
 
     group.finish();

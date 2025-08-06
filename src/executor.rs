@@ -32,10 +32,22 @@ pub enum Command {
     Ping {
         message: Option<String>,
     },
+    ListKeys {
+        pattern: String,
+        limit: Option<u64>,
+    },
+    FlushAll {},
     // custom
+    SetParent {
+        key: String,
+        parent: String,
+    },
+    GetParent {
+        key: String,
+    },
     GetChildren {
         parent: String,
-        depth: usize,
+        depth: Option<u64>,
     },
     GetInfo {
         key: String,
@@ -58,7 +70,7 @@ pub enum CommandResponse {
     Value(String),
     Integer(i64),
     Array(Vec<String>),
-    ArrayWithDepth(Vec<(String, usize)>),
+    ArrayWithDepth(Vec<(String, u64)>),
     KeyInfo(KeyInfo),
     Null,
     Error(String),
@@ -111,26 +123,50 @@ impl CommandExecutor {
                 let ttl = self.cache.ttl(&key);
                 CommandResponse::Integer(ttl)
             }
+
             Command::Expire { key, seconds } => {
-                let success = self.cache.expire(&key, seconds);
-                CommandResponse::Integer(if success { 1 } else { 0 })
-            }
-            Command::Persist { key } => {
-                let success = self.cache.persist(&key);
-                CommandResponse::Integer(if success { 1 } else { 0 })
-            }
-            Command::GetChildren { parent, depth } => {
-                let results = self.cache.children_recursive(&parent, depth);
-                CommandResponse::ArrayWithDepth(results)
+                let result = self.cache.expire(&key, seconds);
+                CommandResponse::Integer(result)
             }
 
-            // TODO: cut or replace ad-hoc REST method
+            Command::Persist { key } => {
+                let result = self.cache.persist(&key);
+                CommandResponse::Integer(result)
+            }
+
+            Command::SetParent { key, parent } => match self.cache.set_parent(&key, parent) {
+                Ok(i) => CommandResponse::Integer(i),
+                Err(e) => CommandResponse::Error(e.to_string()),
+            },
+
+            Command::GetParent { key } => match self.cache.parent(&key) {
+                Some(key) => CommandResponse::Value(key),
+                None => CommandResponse::Null,
+            },
+
+            Command::GetChildren { parent, depth } => {
+                let depth_usize = depth.and_then(|l| usize::try_from(l).ok()).unwrap_or(1);
+
+                let children = self.cache.children_recursive(&parent, depth_usize);
+
+                CommandResponse::ArrayWithDepth(children)
+            }
+
+            Command::ListKeys { pattern, limit } => {
+                let limit_usize = limit
+                    .and_then(|l| usize::try_from(l).ok())
+                    .unwrap_or(usize::MAX);
+
+                let keys = self.cache.keys(&pattern, limit_usize);
+                CommandResponse::Array(keys)
+            }
+
             Command::GetInfo { key } => {
                 let exists = self.cache.exists(&key);
                 let ttl = self.cache.ttl(&key);
                 let value = self.cache.get(&key).map(|v| v.to_string());
                 let parent = self.cache.parent(&key);
-                let children_count = self.cache.children(&key).len();
+                let children_count = self.cache.children_recursive(&key, usize::MAX).len();
 
                 CommandResponse::KeyInfo(KeyInfo {
                     key,
@@ -140,6 +176,11 @@ impl CommandExecutor {
                     parent,
                     children_count,
                 })
+            }
+
+            Command::FlushAll {} => {
+                self.cache.flush_all();
+                CommandResponse::Ok
             }
         }
     }
