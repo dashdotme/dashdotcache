@@ -6,7 +6,7 @@ fn cache_performance(c: &mut Criterion) {
     let mut group = c.benchmark_group("Cache Performance");
 
     for &size in &[1_000, 10_000, 100_000] {
-        group.bench_function(&format!("set_{}", size), |b| {
+        group.bench_function(format!("set_{}", size), |b| {
             b.iter(|| {
                 let cache = Cache::new(Config::default());
                 for i in 0..size {
@@ -21,7 +21,7 @@ fn cache_performance(c: &mut Criterion) {
             });
         });
 
-        group.bench_function(&format!("get_random_{}", size), |b| {
+        group.bench_function(format!("get_random_{}", size), |b| {
             let cache = Cache::new(Config::default());
             for i in 0..size {
                 cache

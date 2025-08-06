@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -91,18 +92,6 @@ impl Value {
                 size += s.iter().map(|v| v.capacity()).sum::<usize>();
                 size
             }
-        }
-    }
-
-    pub fn to_string(&self) -> String {
-        match self {
-            Value::String(s) => s.clone(),
-            Value::Integer(i) => i.to_string(),
-            Value::Float(f) => f.to_string(),
-            Value::Bytes(b) => format!("<{} bytes>", b.len()),
-            Value::Hash(h) => format!("<hash with {} fields>", h.len()),
-            Value::List(l) => format!("<list with {} items>", l.len()),
-            Value::Set(s) => format!("<set with {} members>", s.len()),
         }
     }
 }
@@ -259,11 +248,41 @@ impl Stats {
             };
         }
 
-        write_metric!(&mut s, "cache_hits_total", "Total number of cache hits", "counter", self.hits.load(Ordering::Relaxed));
-        write_metric!(&mut s, "cache_misses_total", "Total number of cache misses", "counter", self.misses.load(Ordering::Relaxed));
-        write_metric!(&mut s, "cache_sets_total", "Total number of SET operations", "counter", self.sets.load(Ordering::Relaxed));
-        write_metric!(&mut s, "cache_deletes_total", "Total number of DELETE operations", "counter", self.deletes.load(Ordering::Relaxed));
-        write_metric!(&mut s, "cache_memory_usage_bytes", "Current estimated memory usage in bytes", "gauge", self.memory_usage.load(Ordering::Relaxed));
+        write_metric!(
+            &mut s,
+            "cache_hits_total",
+            "Total number of cache hits",
+            "counter",
+            self.hits.load(Ordering::Relaxed)
+        );
+        write_metric!(
+            &mut s,
+            "cache_misses_total",
+            "Total number of cache misses",
+            "counter",
+            self.misses.load(Ordering::Relaxed)
+        );
+        write_metric!(
+            &mut s,
+            "cache_sets_total",
+            "Total number of SET operations",
+            "counter",
+            self.sets.load(Ordering::Relaxed)
+        );
+        write_metric!(
+            &mut s,
+            "cache_deletes_total",
+            "Total number of DELETE operations",
+            "counter",
+            self.deletes.load(Ordering::Relaxed)
+        );
+        write_metric!(
+            &mut s,
+            "cache_memory_usage_bytes",
+            "Current estimated memory usage in bytes",
+            "gauge",
+            self.memory_usage.load(Ordering::Relaxed)
+        );
 
         s
     }
@@ -287,13 +306,21 @@ pub struct SetOptions {
 
 impl Cache {
     pub fn new(config: Config) -> Self {
-        Self {
+        let cache = Self {
             data: DashMap::new(),
             config,
             stats: Arc::new(Stats::default()),
             cleanup_shard_index: AtomicUsize::new(0),
             dependency_lock: RwLock::new(()),
-        }
+        };
+
+        let base_memory =
+            std::mem::size_of::<Cache>() + std::mem::size_of::<DashMap<String, Entry>>();
+        cache
+            .stats
+            .memory_usage
+            .store(base_memory, Ordering::Relaxed);
+        cache
     }
 
     /// Checks key liveness on access
@@ -468,7 +495,7 @@ impl Cache {
                     None
                 }
             })
-        .collect()
+            .collect()
     }
 
     // Slow, avoid
@@ -485,7 +512,8 @@ impl Cache {
 
             for entry in self.data.iter() {
                 if let Some(parent) = &entry.parent {
-                    if current_parents.contains(parent) {  // O(1) lookup
+                    if current_parents.contains(parent) {
+                        // O(1) lookup
                         let child = entry.key().clone();
                         result.push((child.clone(), depth));
                         next_parents.insert(child);
@@ -509,6 +537,10 @@ impl Cache {
 
     pub fn len(&self) -> usize {
         self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 
     pub fn memory_usage(&self) -> usize {
@@ -623,8 +655,7 @@ fn matches_pattern(key: &str, pattern: &str) -> bool {
         return true;
     }
 
-    if pattern.ends_with('*') {
-        let prefix = &pattern[..pattern.len() - 1];
+    if let Some(prefix) = pattern.strip_suffix('*') {
         key.starts_with(prefix)
     } else {
         key == pattern
@@ -812,47 +843,76 @@ mod tests {
     fn test_cleanup_expired() {
         let cache = Cache::new(Config::default());
 
-        // Add some entries with very short TTL
-        cache
-            .set(
-                "exp1".to_string(),
-                Value::String("1".to_string()),
-                SetOptions {
-                    ttl: Some(Duration::from_millis(1)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        cache
-            .set(
-                "exp2".to_string(),
-                Value::String("2".to_string()),
-                SetOptions {
-                    ttl: Some(Duration::from_millis(1)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        cache
-            .set(
-                "keep".to_string(),
-                Value::String("keep".to_string()),
-                SetOptions::default(),
-            )
-            .unwrap();
+        // Create enough entries to populate multiple shards across CPU cores
+        let num_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4); // fallback to 4 if detection fails
 
-        assert_eq!(cache.len(), 3);
+        let entries_per_core = 5;
+        let total_expired = num_cores * entries_per_core;
+
+        // Add expired entries distributed across shards
+        for i in 0..total_expired {
+            cache
+                .set(
+                    format!("exp_{}", i),
+                    Value::String(i.to_string()),
+                    SetOptions {
+                        ttl: Some(Duration::from_millis(1)),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        // Add some persistent entries
+        for i in 0..5 {
+            cache
+                .set(
+                    format!("keep_{}", i),
+                    Value::String(format!("keep_{}", i)),
+                    SetOptions::default(),
+                )
+                .unwrap();
+        }
+
+        let initial_count = cache.len();
+        assert_eq!(initial_count, total_expired + 5);
 
         // Wait for expiration
         std::thread::sleep(Duration::from_millis(10));
 
-        // Cleanup - run for each possible shard, to avoid flakiness
-        for _ in 0..cache.data.shards().len() * 3 {
-            cache.cleanup_expired();
+        // Run cleanup enough times to hit all shards multiple times
+        let shard_count = cache.data.shards().len();
+        let cleanup_rounds = shard_count * 5;
+
+        let mut cleaned_count = 0;
+        for _ in 0..cleanup_rounds {
+            cleaned_count += cache.cleanup_expired();
         }
-        assert_eq!(cache.len(), 1);
-        assert!(cache.get("keep").is_some());
-        assert!(cache.get("exp1").is_none());
+
+        // Verify cleanup worked
+        assert!(
+            cleaned_count > 0,
+            "Should have cleaned some expired entries"
+        );
+        assert_eq!(cache.len(), 5, "Should only have persistent entries left");
+
+        // Verify specific entries
+        for i in 0..5 {
+            assert!(
+                cache.get(&format!("keep_{}", i)).is_some(),
+                "Persistent entry should exist"
+            );
+        }
+
+        // Verify expired entries are gone (test a few samples)
+        for i in 0..std::cmp::min(10, total_expired) {
+            assert!(
+                cache.get(&format!("exp_{}", i)).is_none(),
+                "Expired entry should be gone"
+            );
+        }
     }
 
     #[test]

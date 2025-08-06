@@ -1,8 +1,8 @@
 /// Placeholder - TODO after http & cache optimization
 use crate::executor::{Command, CommandExecutor};
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 pub struct RespServer {
     executor: Arc<CommandExecutor>,
 }
@@ -27,7 +27,6 @@ impl RespServer {
     }
 }
 
-
 async fn handle_connection(stream: TcpStream, executor: Arc<CommandExecutor>) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -37,9 +36,10 @@ async fn handle_connection(stream: TcpStream, executor: Arc<CommandExecutor>) {
         // TODO: Implement RESP protocol parsing
         // parse -> Command
         // executor.execute(command);
-        executor.execute(Command::Ping { message: (Some("TODO".to_string())) });
+        executor.execute(Command::Ping {
+            message: (Some("TODO".to_string())),
+        });
         writer.write_all(b"TODO: RESP parsing\r\n").await.ok();
         line.clear();
     }
 }
-

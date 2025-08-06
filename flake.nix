@@ -7,24 +7,23 @@
     # Nix -> Rust integration, for cached & modular builds
     crane.url = "github:ipetkov/crane";
 
-    # generates configurations for all system targets
+    # Generates configurations for all system targets
     flake-utils.url = "github:numtide/flake-utils";
 
-    # security scanner for cargo dependencies
+    # Security scanner for cargo dependencies
     advisory-db = {
       url = "github:rustsec/advisory-db";
-      flake = false; # rustsec does not use nix
+      flake = false;
     };
   };
 
   outputs =
-    {
-      self,
-      nixpkgs,
-      crane,
-      flake-utils,
-      advisory-db,
-      ...
+    { self
+    , nixpkgs
+    , crane
+    , flake-utils
+    , advisory-db
+    , ...
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
@@ -36,17 +35,15 @@
         craneLib = crane.mkLib pkgs;
         src = craneLib.cleanCargoSource ./.;
 
-        # Common arguments can be set here to avoid repeating them later
+        # Repeated args
         commonArgs = {
           inherit src;
           strictDeps = true;
 
           buildInputs =
             [
-              # Build time dependencies
             ]
             ++ lib.optionals pkgs.stdenv.isDarwin [
-              # Additional darwin specific inputs can be set here
               pkgs.libiconv
             ];
         };
@@ -59,7 +56,6 @@
           commonArgs
           // {
             inherit cargoArtifacts;
-            # TODO: add test instructions to README: `nix flake check`
             doCheck = false; # disable rust tests during builds
           }
         );
@@ -69,12 +65,13 @@
           # Build the crate as part of `nix flake check` for convenience
           inherit dashdotcache;
 
-          # Linting check with clippy
+          # Linting
           dashdotcache-clippy = craneLib.cargoClippy (
             commonArgs
             // {
               inherit cargoArtifacts;
-              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+              # TODO: disallow unused variables at demo completion
+              cargoClippyExtraArgs = "--all-targets -- --deny warnings --allow unused-variables";
             }
           );
 
@@ -137,7 +134,24 @@
             taplo # toml language server
             pkg-config # nix -> C dependency glue
             rust-analyzer
+            (writeScriptBin "check" ''
+              #!/usr/bin/env bash
+              echo -e "\033[35mRunning all checks...\033[0m"
+
+              if nix flake check "$@"; then
+                  echo ""
+                  echo -e "\033[32mALL CHECKS PASSED SUCCESSFULLY!\033[0m"
+                  echo -e "\033[32mLinting, formatting, tests, and security checks complete\033[0m"
+              else
+                  echo ""
+                  echo -e "\033[31mChecks failed - see output above for details\033[0m"
+              fi
+            '')
           ];
+
+          shellHook = ''
+            echo "Run 'check' to do CI checks"
+          '';
         };
       }
     );

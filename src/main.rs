@@ -11,7 +11,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache = Arc::new(Cache::new(Config::default()));
     let executor = Arc::new(CommandExecutor::new(cache));
 
-    println!("Cache initialized. Memory usage: {}", executor.cache.memory_usage());
+    println!(
+        "Cache initialized. Memory usage: {}",
+        executor.cache.memory_usage()
+    );
 
     let http_executor = executor.clone();
     let resp_executor = executor.clone();
