@@ -209,7 +209,8 @@ async fn set_parent(
     };
     let response = executor.execute(command);
     match response {
-        CommandResponse::Ok => Ok("Parent set".to_string()),
+        CommandResponse::Integer(1) => Ok("Parent set".to_string()),
+        CommandResponse::Integer(0) => Err(ApiError::NotFound("Key not found".to_string())),
         CommandResponse::Error(e) => Err(ApiError::BadRequest(e)),
         _ => Err(ApiError::InternalError("Unexpected response".to_string())),
     }
