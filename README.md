@@ -30,8 +30,10 @@ nix run
 
 ## Development
 ### CI checks
-From within a `nix develop` environment
-`check`
+From within a `nix develop` environment, run:
+```
+check
+```
 
 This checks linting, formatting, licenses and dependencies via `nix flake check`, with tidied output.
 
@@ -41,5 +43,6 @@ cargo nextest run
 ```
 
 ### Benchmarks
-`cargo bench`
-
+```
+cargo bench
+```
